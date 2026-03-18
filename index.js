@@ -1,12 +1,17 @@
 const express = require("express");
 const axios = require("axios");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
 
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const PORT = process.env.PORT || 3000;
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // =========================
 // Utility
@@ -27,8 +32,6 @@ function isTextMessageEvent(event) {
 function shouldAskClarifyingQuestions(userMessage) {
   const text = String(userMessage || "").trim();
 
-  // 文案作成モードは質問せず即返したいことが多いが、
-  // 情報不足ならAI側で必要事項を聞く
   const shortText = text.length < 18;
 
   const vaguePatterns = [
@@ -47,7 +50,6 @@ function shouldAskClarifyingQuestions(userMessage) {
 
   const hasVaguePattern = vaguePatterns.some((p) => text.includes(p));
 
-  // 情報がある程度入っているかの簡易判定
   const detailSignals = [
     "契約",
     "書面",
@@ -168,6 +170,7 @@ function buildLeoSystemPrompt() {
 - 相手に送る返信文や確認事項のたたき台を作る
 - 情報不足なら先にヒアリングして精度を高める
 - 回答不能または不確実な場合は、無理に断定せず安全な代替案を出す
+- 直近の会話履歴がある場合は、それを踏まえて一貫性のある回答をする
 
 【絶対ルール】
 - 間違った情報を断定しない
@@ -255,6 +258,61 @@ function buildLeoSystemPrompt() {
 `;
 }
 
+// =========================
+// Supabase: 保存
+// =========================
+async function saveMessage(userId, role, content) {
+  try {
+    if (!userId || !role || !content) return;
+
+    const { error } = await supabase.from("messages").insert([
+      {
+        user_id: userId,
+        role,
+        content: String(content)
+      }
+    ]);
+
+    if (error) {
+      console.error("Supabase save error:", error.message);
+    }
+  } catch (error) {
+    console.error("Supabase save exception:", error.message);
+  }
+}
+
+// =========================
+// Supabase: 履歴取得
+// =========================
+async function getRecentMessages(userId, limit = 8) {
+  try {
+    if (!userId) return [];
+
+    const { data, error } = await supabase
+      .from("messages")
+      .select("role, content, created_at")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      console.error("Supabase fetch error:", error.message);
+      return [];
+    }
+
+    return (data || [])
+      .reverse()
+      .map((msg) => ({
+        role: msg.role,
+        content: truncateText(msg.content, 1500)
+      }))
+      .filter((msg) => ["user", "assistant"].includes(msg.role));
+  } catch (error) {
+    console.error("Supabase fetch exception:", error.message);
+    return [];
+  }
+}
+
 async function callOpenAI(messages) {
   const response = await axios.post(
     "https://api.openai.com/v1/chat/completions",
@@ -275,10 +333,11 @@ async function callOpenAI(messages) {
   return response.data.choices?.[0]?.message?.content || "";
 }
 
-async function generateLeoReply(userMessage) {
+async function generateLeoReply(userId, userMessage) {
   const risk = estimateRiskLabel(userMessage);
   const needsClarifying = shouldAskClarifyingQuestions(userMessage);
   const isDraftMode = detectReplyDraftMode(userMessage);
+  const history = await getRecentMessages(userId, 8);
 
   if (needsClarifying) {
     return buildClarifyingQuestionText(userMessage);
@@ -286,17 +345,28 @@ async function generateLeoReply(userMessage) {
 
   const systemPrompt = buildLeoSystemPrompt();
 
-  const userPrompt = `
+  let userPrompt = `
 以下の相談に対して、法務顧問レオとして回答してください。
 危険度は「${risk}」を基本目安として判断してください。
+直近の会話履歴がある場合は、前後関係を踏まえて矛盾のない回答にしてください。
 相談文：
 ${userMessage}
 `;
 
-  const reply = await callOpenAI([
+  if (isDraftMode) {
+    userPrompt += `
+これは文案作成モードの可能性が高い相談です。
+必要なら前提を短く整理した上で、
+「やわらかめ」「標準」「強めだが冷静」の3パターンを出してください。`;
+  }
+
+  const messages = [
     { role: "system", content: systemPrompt },
+    ...history,
     { role: "user", content: userPrompt }
-  ]);
+  ];
+
+  const reply = await callOpenAI(messages);
 
   if (!reply) {
     return `現時点ではうまく回答を生成できませんでした。
@@ -344,19 +414,29 @@ app.post("/webhook", async (req, res) => {
       try {
         if (!isTextMessageEvent(event)) continue;
 
+        const userId = event.source?.userId;
         const userMessage = String(event.message.text || "").trim();
         if (!userMessage) continue;
 
-        const replyText = await generateLeoReply(userMessage);
+        // ユーザー発言保存
+        await saveMessage(userId, "user", userMessage);
+
+        // AI生成
+        const replyText = await generateLeoReply(userId, userMessage);
+
+        // AI発言保存
+        await saveMessage(userId, "assistant", replyText);
+
+        // LINE返信
         await replyToLine(event.replyToken, replyText);
       } catch (eventError) {
-        console.error("Event handling error:", eventError.response?.data || eventError.message);
+        console.error(
+          "Event handling error:",
+          eventError.response?.data || eventError.message
+        );
 
-        // 個別イベントで失敗しても全体を落とさない
         try {
-          await replyToLine(
-            event.replyToken,
-            `すみません、今は正確な回答をすぐ返せない状態です。
+          const fallbackText = `すみません、今は正確な回答をすぐ返せない状態です。
 精度を上げるため、次の内容を送ってください。
 
 ・何が起きているか
@@ -366,10 +446,19 @@ app.post("/webhook", async (req, res) => {
 ・日付
 ・最終的にどうしたいか
 
-いただければ、改めて整理して回答します。`
-          );
+いただければ、改めて整理して回答します。`;
+
+          await replyToLine(event.replyToken, fallbackText);
+
+          const userId = event.source?.userId;
+          if (userId) {
+            await saveMessage(userId, "assistant", fallbackText);
+          }
         } catch (replyError) {
-          console.error("Fallback reply error:", replyError.response?.data || replyError.message);
+          console.error(
+            "Fallback reply error:",
+            replyError.response?.data || replyError.message
+          );
         }
       }
     }
